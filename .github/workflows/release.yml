@@ -1,0 +1,54 @@
+name: Build temporary WSL worker release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate source syntax
+        shell: pwsh
+        run: ./tools/Validate-Project.ps1
+
+      - name: Install rootfs build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap shellcheck
+          shellcheck linux/build-rootfs.sh linux/overlay/usr/local/sbin/opti-temporary-worker linux/overlay/usr/local/sbin/opti-wsl-keepalive
+
+      - name: Build pinned CPU-only WSL rootfs
+        run: |
+          chmod +x linux/build-rootfs.sh
+          sudo linux/build-rootfs.sh "$PWD/artifacts"
+          sudo chown -R "$USER:$USER" artifacts
+
+      - name: Assemble and hash release
+        run: |
+          cp bootstrap/Install-OptiTemporaryWorker.ps1 artifacts/Install-OptiTemporaryWorker.ps1
+          cp bootstrap/Remove-OptiTemporaryWorker.ps1 artifacts/Remove-OptiTemporaryWorker.ps1
+          python3 tools/build_release_manifest.py artifacts --version "${GITHUB_REF_NAME:-manual}"
+          cat artifacts/release-manifest.json
+
+      - name: Publish immutable named assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: |
+            artifacts/Install-OptiTemporaryWorker.ps1
+            artifacts/Install-OptiTemporaryWorker.ps1.sha256
+            artifacts/Remove-OptiTemporaryWorker.ps1
+            artifacts/opti-temporary-worker-rootfs.tar.gz
+            artifacts/opti-temporary-worker-rootfs.tar.gz.sha256
+            artifacts/release-manifest.json
+            artifacts/release-manifest.json.sha256

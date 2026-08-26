@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+while [ ! -f /var/lib/opti-temporary-worker/retired ]; do
+  if ! systemctl is-active --quiet opti-temporary-worker.service; then
+    systemctl reset-failed opti-temporary-worker.service >/dev/null 2>&1 || true
+    systemctl start opti-temporary-worker.service >/dev/null 2>&1 || true
+  fi
+  sleep 15
+done
+exit 0

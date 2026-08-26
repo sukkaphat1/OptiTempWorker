@@ -1,0 +1,11 @@
+artifacts/
+build/
+*.log
+*.tar
+*.tar.gz
+*.sha256
+!release-manifest.example.json
+.pytest_cache/
+__pycache__/
+*.pyc
+

@@ -1,0 +1,7 @@
+numpy==1.26.4
+requests==2.34.2
+psutil==7.2.2
+tomli==2.4.1
+rocketsim==2.2.1
+git+https://github.com/AechPro/rocket-league-gym-sim@a1240530239d6b7671147b4f97e9b5e130d0acce
+

@@ -1,0 +1,19 @@
+[Unit]
+Description=Opti temporary WSL rollout supervisor
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/opti-temporary-worker run
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=120
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=CUDA_VISIBLE_DEVICES=-1
+
+[Install]
+WantedBy=multi-user.target
+
