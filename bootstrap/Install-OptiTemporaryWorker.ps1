@@ -39,26 +39,26 @@ function Start-Elevated {
     Start-Process powershell.exe -Verb RunAs -ArgumentList $arguments | Out-Null
 }
 
-function ConvertFrom-JoinBundle([string]$Value) {
-    $encoded = $Value.Replace('-', '+').Replace('_', '/')
+function ConvertFrom-JoinBundle([string]$EncodedBundle) {
+    $encoded = $EncodedBundle.Replace('-', '+').Replace('_', '/')
     while (($encoded.Length % 4) -ne 0) { $encoded += '=' }
     try {
         $bytes = [Convert]::FromBase64String($encoded)
-        $value = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        $bundle = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
     } catch {
         throw 'The temporary worker join bundle is invalid.'
     }
-    if ([string]$value.format -ne 'opti-temporary-wsl-join-v1') { throw 'The join bundle format is not supported.' }
-    if ([string]$value.github_repository -notmatch '^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$') {
+    if ([string]$bundle.format -ne 'opti-temporary-wsl-join-v1') { throw 'The join bundle format is not supported.' }
+    if ([string]$bundle.github_repository -notmatch '^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$') {
         throw 'The join bundle GitHub repository is invalid.'
     }
-    if ([string]$value.host_url -notmatch '^https?://') { throw 'The join bundle host URL is invalid.' }
-    if ([string]$value.claim_token -notlike 'owtm_*') { throw 'The temporary machine claim is invalid.' }
-    if ([string]$value.tailscale_auth_key -notlike 'tskey-*') { throw 'The Tailscale auth key is invalid.' }
-    if ([string]$value.release_manifest_sha256 -notmatch '^[a-fA-F0-9]{64}$') {
+    if ([string]$bundle.host_url -notmatch '^https?://') { throw 'The join bundle host URL is invalid.' }
+    if ([string]$bundle.claim_token -notlike 'owtm_*') { throw 'The temporary machine claim is invalid.' }
+    if ([string]$bundle.tailscale_auth_key -notlike 'tskey-*') { throw 'The Tailscale auth key is invalid.' }
+    if ([string]$bundle.release_manifest_sha256 -notmatch '^[a-fA-F0-9]{64}$') {
         throw 'The pinned release manifest checksum is invalid.'
     }
-    return $value
+    return $bundle
 }
 
 function Protect-JoinBundle([string]$Value, [string]$Destination) {

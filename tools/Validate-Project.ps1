@@ -16,6 +16,49 @@ foreach ($relative in @(
     }
 }
 
+# Execute the join-bundle parser in isolation. This catches PowerShell's
+# case-insensitive typed-variable coercion, which syntax parsing alone cannot
+# detect.
+$bootstrapPath = Join-Path $Root 'bootstrap\Install-OptiTemporaryWorker.ps1'
+$tokens = $null; $errors = $null
+$bootstrapAst = [Management.Automation.Language.Parser]::ParseFile(
+    $bootstrapPath, [ref]$tokens, [ref]$errors
+)
+$bundleFunction = $bootstrapAst.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'ConvertFrom-JoinBundle'
+}, $true)
+if (-not $bundleFunction) {
+    Write-Error 'Join-bundle parser function is missing.' -ErrorAction Continue
+    $Failed = $true
+} else {
+    . ([scriptblock]::Create($bundleFunction.Extent.Text))
+    $samplePayload = [ordered]@{
+        format = 'opti-temporary-wsl-join-v1'
+        created_at = [DateTimeOffset]::UtcNow.ToString('o')
+        host_url = 'http://100.64.0.1:7443'
+        claim_token = 'owtm_validation'
+        tailscale_auth_key = 'tskey-auth-validation'
+        github_repository = 'owner/OptiTempWorker'
+        release_manifest_sha256 = ('a' * 64)
+    }
+    $sampleJson = $samplePayload | ConvertTo-Json -Compress
+    $sampleBundle = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($sampleJson)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    try {
+        $decodedBundle = ConvertFrom-JoinBundle $sampleBundle
+        if ([string]$decodedBundle.format -ne 'opti-temporary-wsl-join-v1' -or
+                [string]$decodedBundle.claim_token -ne 'owtm_validation') {
+            throw 'Decoded join bundle did not preserve its fields.'
+        }
+    } catch {
+        Write-Error "Join-bundle parser regression: $($_.Exception.Message)" -ErrorAction Continue
+        $Failed = $true
+    } finally {
+        Remove-Item Function:\ConvertFrom-JoinBundle -ErrorAction SilentlyContinue
+    }
+}
+
 $python = Get-Command python -ErrorAction SilentlyContinue
 if (-not $python) { $python = Get-Command py -ErrorAction SilentlyContinue }
 if (-not $python) { throw 'Python is required for validation.' }
