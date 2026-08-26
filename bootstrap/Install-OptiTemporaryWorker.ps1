@@ -61,19 +61,30 @@ function ConvertFrom-JoinBundle([string]$EncodedBundle) {
     return $bundle
 }
 
+function Initialize-DataProtection {
+    if (-not ('System.Security.Cryptography.ProtectedData' -as [type])) {
+        Add-Type -AssemblyName System.Security -ErrorAction Stop
+    }
+    if (-not ('System.Security.Cryptography.ProtectedData' -as [type])) {
+        throw 'Windows DPAPI is unavailable in this PowerShell installation.'
+    }
+}
+
 function Protect-JoinBundle([string]$Value, [string]$Destination) {
+    Initialize-DataProtection
     $plain = [Text.Encoding]::UTF8.GetBytes($Value)
-    $protected = [Security.Cryptography.ProtectedData]::Protect(
-        $plain, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser
+    $protected = [System.Security.Cryptography.ProtectedData]::Protect(
+        $plain, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser
     )
     [IO.File]::WriteAllBytes($Destination, $protected)
 }
 
 function Unprotect-JoinBundle([string]$Source) {
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw 'The protected join bundle is missing.' }
+    Initialize-DataProtection
     $protected = [IO.File]::ReadAllBytes($Source)
-    $plain = [Security.Cryptography.ProtectedData]::Unprotect(
-        $protected, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser
+    $plain = [System.Security.Cryptography.ProtectedData]::Unprotect(
+        $protected, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser
     )
     return [Text.Encoding]::UTF8.GetString($plain)
 }

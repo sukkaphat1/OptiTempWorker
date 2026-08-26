@@ -59,6 +59,39 @@ if (-not $bundleFunction) {
     }
 }
 
+if ($env:OS -eq 'Windows_NT') {
+    $dataProtectionFunctions = @('Initialize-DataProtection', 'Protect-JoinBundle', 'Unprotect-JoinBundle')
+    foreach ($functionName in $dataProtectionFunctions) {
+        $functionAst = $bootstrapAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $functionName
+        }, $true)
+        if (-not $functionAst) {
+            Write-Error "Installer function is missing: $functionName" -ErrorAction Continue
+            $Failed = $true
+        } else {
+            . ([scriptblock]::Create($functionAst.Extent.Text))
+        }
+    }
+    $dpapiTestPath = Join-Path ([IO.Path]::GetTempPath()) ("opti-dpapi-validation-$([guid]::NewGuid().ToString('N')).bin")
+    try {
+        $dpapiSample = 'Opti DPAPI validation payload'
+        Protect-JoinBundle -Value $dpapiSample -Destination $dpapiTestPath
+        if ((Unprotect-JoinBundle -Source $dpapiTestPath) -ne $dpapiSample) {
+            throw 'DPAPI round trip did not preserve the join bundle.'
+        }
+    } catch {
+        Write-Error "Windows DPAPI regression: $($_.Exception.Message)" -ErrorAction Continue
+        $Failed = $true
+    } finally {
+        Remove-Item -LiteralPath $dpapiTestPath -Force -ErrorAction SilentlyContinue
+        foreach ($functionName in $dataProtectionFunctions) {
+            Remove-Item "Function:\$functionName" -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 $python = Get-Command python -ErrorAction SilentlyContinue
 if (-not $python) { $python = Get-Command py -ErrorAction SilentlyContinue }
 if (-not $python) { throw 'Python is required for validation.' }
