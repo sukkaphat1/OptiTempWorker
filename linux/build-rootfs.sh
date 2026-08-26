@@ -16,10 +16,18 @@ source "$repo_root/versions.env"
 work="$(mktemp -d -t opti-wsl-rootfs-XXXXXX)"
 rootfs="$work/rootfs"
 unmount_runtime() {
-  mountpoint -q "$rootfs/dev/pts" && umount -lf "$rootfs/dev/pts" || true
-  mountpoint -q "$rootfs/dev" && umount -lf "$rootfs/dev" || true
-  mountpoint -q "$rootfs/sys" && umount -lf "$rootfs/sys" || true
-  mountpoint -q "$rootfs/proc" && umount -lf "$rootfs/proc" || true
+  if mountpoint -q "$rootfs/dev/pts"; then
+    umount -lf "$rootfs/dev/pts" || true
+  fi
+  if mountpoint -q "$rootfs/dev"; then
+    umount -lf "$rootfs/dev" || true
+  fi
+  if mountpoint -q "$rootfs/sys"; then
+    umount -lf "$rootfs/sys" || true
+  fi
+  if mountpoint -q "$rootfs/proc"; then
+    umount -lf "$rootfs/proc" || true
+  fi
 }
 cleanup() {
   unmount_runtime
