@@ -350,6 +350,21 @@ def stop_slots(*, persistent: bool = True) -> None:
         marker.parent.mkdir(parents=True, exist_ok=True); marker.write_text("stop\n", encoding="ascii")
 
 
+def resume_slots() -> None:
+    """Clear a scheduled-window drain without changing machine identity."""
+    if (STATE_ROOT / "retired").is_file():
+        raise ControlError("a retired temporary worker cannot be resumed")
+    try: DRAIN_REQUEST.unlink()
+    except FileNotFoundError: pass
+    if not STATE.is_file(): return
+    machine = read_json(STATE)
+    for item in machine.get("slots", []):
+        index = int(item["slot_index"])
+        marker = STATE_ROOT / "slots" / f"slot-{index:03d}" / "stop.requested"
+        try: marker.unlink()
+        except FileNotFoundError: pass
+
+
 def retire() -> None:
     stop_slots()
     if STATE.is_file():
@@ -407,18 +422,22 @@ def run_fleet() -> None:
     if not STATE.is_file(): provision()
     machine = read_json(STATE); handoff = read_json(HANDOFF)
     client = HostClient(str(machine["slots"][0]["host_url"])); client.health()
-    expires = datetime.fromisoformat(str(machine["expires_at"]))
-    drain_at = expires - timedelta(seconds=DEFAULT_DRAIN_SECONDS)
-    draining = DRAIN_REQUEST.is_file()
-    if draining: processes, logs = [], []
-    else: processes, logs = spawn_slots(machine)
+    expires_text = str(machine.get("expires_at", "")).strip()
+    expires = datetime.fromisoformat(expires_text) if expires_text else None
+    drain_at = expires - timedelta(seconds=DEFAULT_DRAIN_SECONDS) if expires else None
+    # A scheduled Windows shutdown leaves a durable drain marker. If systemd
+    # races ahead of the Windows resume command on the next WSL boot, exit
+    # cleanly and let the hidden keepalive restart us after resume clears it.
+    if DRAIN_REQUEST.is_file(): return
+    draining = False
+    processes, logs = spawn_slots(machine)
     last_update = 0.0
     try:
         while True:
             now = datetime.now(timezone.utc)
-            if (now >= drain_at or DRAIN_REQUEST.is_file()) and not draining:
+            if ((drain_at is not None and now >= drain_at) or DRAIN_REQUEST.is_file()) and not draining:
                 stop_slots(); draining = True
-            if now >= expires:
+            if expires is not None and now >= expires:
                 terminate_processes(processes, timeout=60); retire()
                 expired_path = str(handoff.get("windows_expired_path", ""))
                 if expired_path.startswith("/mnt/c/ProgramData/OptiTemporaryWorker/"):
@@ -462,6 +481,7 @@ def main() -> int:
     if action == "provision": provision()
     elif action == "run": run_fleet()
     elif action == "drain": stop_slots()
+    elif action == "resume": resume_slots()
     elif action == "retire": retire()
     else: raise ControlError(f"unknown action: {action}")
     return 0

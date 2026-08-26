@@ -100,6 +100,30 @@ class PayloadVerificationTests(unittest.TestCase):
                 control.verify_payload(payload, "build-123")
 
 
+class ScheduledWindowTests(unittest.TestCase):
+    def test_resume_clears_only_drain_markers_and_preserves_machine_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_name:
+            root = Path(temporary_name)
+            previous = (control.STATE_ROOT, control.STATE, control.DRAIN_REQUEST)
+            try:
+                control.STATE_ROOT = root
+                control.STATE = root / "machine.json"
+                control.DRAIN_REQUEST = root / "drain.requested"
+                machine = {"machine_id": "tm_test", "slots": [{"slot_index": 1}, {"slot_index": 2}]}
+                control.STATE.write_text(json.dumps(machine), encoding="utf-8")
+                control.DRAIN_REQUEST.write_text("stop\n", encoding="ascii")
+                for index in (1, 2):
+                    marker = root / "slots" / f"slot-{index:03d}" / "stop.requested"
+                    marker.parent.mkdir(parents=True, exist_ok=True)
+                    marker.write_text("stop\n", encoding="ascii")
+                control.resume_slots()
+                self.assertFalse(control.DRAIN_REQUEST.exists())
+                self.assertFalse(any((root / "slots").rglob("stop.requested")))
+                self.assertEqual(json.loads(control.STATE.read_text(encoding="utf-8"))["machine_id"], "tm_test")
+            finally:
+                control.STATE_ROOT, control.STATE, control.DRAIN_REQUEST = previous
+
+
 class ReleaseManifestTests(unittest.TestCase):
     def test_release_manifest_pins_every_install_asset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_name:

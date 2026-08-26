@@ -1,6 +1,6 @@
 # Opti Temporary Windows/WSL Worker
 
-This repository contains only the public bootstrap appliance for short-lived
+This repository contains only the public bootstrap appliance for isolated
 Opti CPU rollout workers. It never contains Opti checkpoints, policies,
 training history, host secrets, Tailscale OAuth credentials, auth keys, or
 worker enrollment claims.
@@ -16,9 +16,12 @@ dedicated Windows PC the command:
 6. starts Tailscale only inside that distribution;
 7. consumes the one-use host claim and creates one rollout slot per usable CPU;
 8. downloads the exact current worker payload from the Opti host over Tailscale;
-9. runs without a taskbar window; and
-10. drains, retires, logs out of Tailscale, unregisters the distribution, and
-    removes its own files after the host-issued lifetime.
+9. runs without a taskbar or terminal window;
+10. optionally follows a daily start/shutdown window in a selected time zone;
+11. optionally prevents Windows sleep only while the worker is running; and
+12. at expiration, drains, retires, logs out of Tailscale, unregisters the
+    distribution, and removes its own files. No-expiration workers remain until
+    the operator runs the included uninstaller.
 
 The existing bootable Opti Worker ISO is a different appliance and is not
 built, modified, or configured by this repository.
@@ -74,6 +77,10 @@ sudo ./linux/build-rootfs.sh ./artifacts
   unregistered.
 - Completed rollout packets are uploaded and acknowledged before their local
   copies are removed.
+- A daily shutdown drains current rollouts, terminates the WSL VM, and preserves
+  the machine identity and cached worker state for the next scheduled start.
+- The background keep-awake request changes no Windows power-plan settings and
+  is released as soon as the worker stops.
 - If the PC is off at expiration, the cleanup task runs at the next login.
 - If setup enabled WSL for the first time, expiration may restart Windows once
   to finish restoring the optional features to their original disabled state.

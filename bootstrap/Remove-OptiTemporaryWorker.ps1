@@ -11,6 +11,7 @@ $StatePath = Join-Path $InstallRoot 'install-state.json'
 $Marker = Join-Path $InstallRoot '.opti-temporary-worker-install'
 $SetupTask = 'Opti Temporary Worker Setup'
 $RuntimeTask = 'Opti Temporary Worker Runtime'
+$ScheduleTask = 'Opti Temporary Worker Schedule'
 $CleanupTask = 'Opti Temporary Worker Expiration'
 
 function Write-RemovalLog([string]$Message) {
@@ -64,6 +65,7 @@ try {
     }
 
     Write-RemovalLog 'Stopping new assignments and allowing current rollout uploads to finish'
+    Stop-ScheduledTask -TaskName $ScheduleTask -ErrorAction SilentlyContinue
     & wsl.exe -d $distro -u root -- /usr/local/sbin/opti-temporary-worker drain 2>$null
     $drainDeadline = (Get-Date).AddMinutes(3)
     do {
@@ -125,7 +127,7 @@ try {
         $restartNeeded = $true
     }
 
-    foreach ($task in @($SetupTask, $RuntimeTask, $CleanupTask)) {
+    foreach ($task in @($SetupTask, $RuntimeTask, $ScheduleTask, $CleanupTask)) {
         Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
     }
 

@@ -24,6 +24,39 @@ $tokens = $null; $errors = $null
 $bootstrapAst = [Management.Automation.Language.Parser]::ParseFile(
     $bootstrapPath, [ref]$tokens, [ref]$errors
 )
+$stateSetter = $bootstrapAst.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Set-StateValue'
+}, $true)
+if (-not $stateSetter) {
+    Write-Error 'Upgrade-safe state setter is missing.' -ErrorAction Continue
+    $Failed = $true
+} else {
+    . ([scriptblock]::Create($stateSetter.Extent.Text))
+    try {
+        $sampleState = [pscustomobject]@{ phase = 'created' }
+        Set-StateValue $sampleState 'machine_id' 'tm_validation'
+        Set-StateValue $sampleState 'phase' 'complete'
+        if ([string]$sampleState.machine_id -ne 'tm_validation' -or [string]$sampleState.phase -ne 'complete') {
+            throw 'State fields were not added and updated correctly.'
+        }
+    } catch {
+        Write-Error "Installer state regression: $($_.Exception.Message)" -ErrorAction Continue
+        $Failed = $true
+    } finally {
+        Remove-Item Function:\Set-StateValue -ErrorAction SilentlyContinue
+    }
+}
+
+$bootstrapText = Get-Content -LiteralPath $bootstrapPath -Raw
+foreach ($requiredText in @('-RuntimeAction run', '-RuntimeAction monitor', 'schedule_timezone',
+                             'prevent_sleep', 'SetThreadExecutionState')) {
+    if ($bootstrapText -notmatch [regex]::Escape($requiredText)) {
+        Write-Error "Installer runtime feature is missing: $requiredText" -ErrorAction Continue
+        $Failed = $true
+    }
+}
 $bundleFunction = $bootstrapAst.Find({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -87,6 +120,27 @@ if ($env:OS -eq 'Windows_NT') {
     } finally {
         Remove-Item -LiteralPath $dpapiTestPath -Force -ErrorAction SilentlyContinue
         foreach ($functionName in $dataProtectionFunctions) {
+            Remove-Item "Function:\$functionName" -ErrorAction SilentlyContinue
+        }
+    }
+    $powerFunctions = @('Hold-SystemAwake', 'Release-SystemAwake')
+    foreach ($functionName in $powerFunctions) {
+        $functionAst = $bootstrapAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $functionName
+        }, $true)
+        if (-not $functionAst) { throw "Installer function is missing: $functionName" }
+        . ([scriptblock]::Create($functionAst.Extent.Text))
+    }
+    try {
+        Hold-SystemAwake $true
+        Release-SystemAwake
+    } catch {
+        Write-Error "Windows sleep-hold regression: $($_.Exception.Message)" -ErrorAction Continue
+        $Failed = $true
+    } finally {
+        foreach ($functionName in $powerFunctions) {
             Remove-Item "Function:\$functionName" -ErrorAction SilentlyContinue
         }
     }

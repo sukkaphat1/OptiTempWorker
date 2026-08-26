@@ -2,7 +2,8 @@
 param(
     [string]$JoinBundle = '',
     [switch]$Resume,
-    [switch]$NoAutomaticRestart
+    [switch]$NoAutomaticRestart,
+    [string]$RuntimeAction = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,6 +14,7 @@ $ProtectedJoinPath = Join-Path $InstallRoot 'join.protected'
 $InstalledBootstrap = Join-Path $InstallRoot 'Install-OptiTemporaryWorker.ps1'
 $SetupTask = 'Opti Temporary Worker Setup'
 $RuntimeTask = 'Opti Temporary Worker Runtime'
+$ScheduleTask = 'Opti Temporary Worker Schedule'
 $CleanupTask = 'Opti Temporary Worker Expiration'
 
 function Write-Step([string]$Message) {
@@ -36,6 +38,7 @@ function Start-Elevated {
     if ($JoinBundle) { $arguments += @('-JoinBundle', $JoinBundle) }
     if ($Resume) { $arguments += '-Resume' }
     if ($NoAutomaticRestart) { $arguments += '-NoAutomaticRestart' }
+    if ($RuntimeAction) { $arguments += @('-RuntimeAction', $RuntimeAction) }
     Start-Process powershell.exe -Verb RunAs -ArgumentList $arguments | Out-Null
 }
 
@@ -89,9 +92,17 @@ function Unprotect-JoinBundle([string]$Source) {
     return [Text.Encoding]::UTF8.GetString($plain)
 }
 
+function Set-StateValue($State, [string]$Name, $Value) {
+    if ($State.PSObject.Properties.Name -contains $Name) {
+        $State.$Name = $Value
+    } else {
+        $State | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+    }
+}
+
 function Save-State($State) {
     $temporary = "$StatePath.$([guid]::NewGuid().ToString('N')).tmp"
-    $State.updated_at = [DateTime]::UtcNow.ToString('o')
+    Set-StateValue $State 'updated_at' ([DateTime]::UtcNow.ToString('o'))
     $State | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $temporary -Encoding UTF8
     Move-Item -LiteralPath $temporary -Destination $StatePath -Force
 }
@@ -117,9 +128,13 @@ function Set-PrivateAcl([string]$Path, [string]$UserSid) {
 function Register-InteractiveTask([string]$Name, $Action, $Trigger, [string]$UserName) {
     $principal = New-ScheduledTaskPrincipal -UserId $UserName -LogonType Interactive -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
-        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-    Register-ScheduledTask -TaskName $Name -Action $Action -Trigger $Trigger -Principal $principal `
-        -Settings $settings -Force | Out-Null
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden
+    $parameters = @{
+        TaskName = $Name; Action = $Action; Principal = $principal
+        Settings = $settings; Force = $true
+    }
+    if ($null -ne $Trigger) { $parameters.Trigger = $Trigger }
+    Register-ScheduledTask @parameters | Out-Null
 }
 
 function Register-ResumeTask($State) {
@@ -130,8 +145,106 @@ function Register-ResumeTask($State) {
     Register-InteractiveTask -Name $SetupTask -Action $action -Trigger $trigger -UserName ([string]$State.user_name)
 }
 
+function Resolve-ScheduleTimeZone([string]$Value) {
+    $aliases = @{
+        'America/Chicago' = 'Central Standard Time'
+        'America/New_York' = 'Eastern Standard Time'
+        'America/Denver' = 'Mountain Standard Time'
+        'America/Los_Angeles' = 'Pacific Standard Time'
+        'America/Anchorage' = 'Alaskan Standard Time'
+        'Pacific/Honolulu' = 'Hawaiian Standard Time'
+        'Etc/UTC' = 'UTC'
+    }
+    $candidate = $Value.Trim()
+    if ($aliases.ContainsKey($candidate)) { $candidate = $aliases[$candidate] }
+    try { [void][TimeZoneInfo]::FindSystemTimeZoneById($candidate) }
+    catch { throw "Windows does not recognize schedule time zone '$Value'." }
+    return $candidate
+}
+
+function Test-ScheduleWindow($State) {
+    if (-not [bool]$State.schedule_enabled) { return $true }
+    $zone = [TimeZoneInfo]::FindSystemTimeZoneById([string]$State.schedule_timezone)
+    $local = [TimeZoneInfo]::ConvertTime([DateTimeOffset]::UtcNow, $zone)
+    $startParts = ([string]$State.schedule_start).Split(':')
+    $stopParts = ([string]$State.schedule_stop).Split(':')
+    $minute = $local.Hour * 60 + $local.Minute
+    $start = [int]$startParts[0] * 60 + [int]$startParts[1]
+    $stop = [int]$stopParts[0] * 60 + [int]$stopParts[1]
+    if ($start -lt $stop) { return $minute -ge $start -and $minute -lt $stop }
+    return $minute -ge $start -or $minute -lt $stop
+}
+
+function Start-WorkerRuntime($State) {
+    $distro = [string]$State.distro_name
+    if ((Get-Distros) -notcontains $distro) { return }
+    & wsl.exe -d $distro -u root -- /usr/local/sbin/opti-temporary-worker resume 2>$null
+    $task = Get-ScheduledTask -TaskName $RuntimeTask -ErrorAction SilentlyContinue
+    if ($task -and $task.State -ne 'Running') { Start-ScheduledTask -TaskName $RuntimeTask }
+}
+
+function Stop-WorkerRuntime($State) {
+    $distro = [string]$State.distro_name
+    $runtime = Get-ScheduledTask -TaskName $RuntimeTask -ErrorAction SilentlyContinue
+    if ((-not $runtime -or $runtime.State -ne 'Running') -and
+        (Get-RunningDistros) -notcontains $distro) { return }
+    Stop-ScheduledTask -TaskName $RuntimeTask -ErrorAction SilentlyContinue
+    if ((Get-Distros) -notcontains $distro) { return }
+    & wsl.exe -d $distro -u root -- /usr/local/sbin/opti-temporary-worker drain 2>$null
+    $deadline = (Get-Date).AddMinutes(3)
+    do {
+        $active = & wsl.exe -d $distro -u root -- /bin/bash -lc `
+            "pgrep -f '[m]ulti_worker.worker_main' >/dev/null && echo active || echo done" 2>$null
+        if (([string]$active).Trim() -eq 'done') { break }
+        Start-Sleep -Seconds 3
+    } while ((Get-Date) -lt $deadline)
+    & wsl.exe -d $distro -u root -- systemctl stop opti-temporary-worker.service 2>$null
+    & wsl.exe --terminate $distro 2>$null
+}
+
+function Invoke-ScheduleReconcile($State) {
+    $expires = [string]$State.expires_at
+    if ($expires -and [DateTimeOffset]::Parse($expires) -le [DateTimeOffset]::UtcNow) {
+        $cleanup = Get-ScheduledTask -TaskName $CleanupTask -ErrorAction SilentlyContinue
+        if ($cleanup -and $cleanup.State -ne 'Running') { Start-ScheduledTask -TaskName $CleanupTask }
+        return $false
+    }
+    if (Test-ScheduleWindow $State) { Start-WorkerRuntime $State }
+    else { Stop-WorkerRuntime $State }
+    return $true
+}
+
+function Hold-SystemAwake([bool]$Enabled) {
+    if (-not $Enabled) { return }
+    if (-not ('OptiTemporaryWorker.Power' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace OptiTemporaryWorker {
+  public static class Power {
+    [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint flags);
+  }
+}
+'@
+    }
+    [void][OptiTemporaryWorker.Power]::SetThreadExecutionState([uint32]2147483649)
+}
+
+function Release-SystemAwake {
+    if ('OptiTemporaryWorker.Power' -as [type]) {
+        [void][OptiTemporaryWorker.Power]::SetThreadExecutionState([uint32]2147483648)
+    }
+}
+
 function Get-Distros {
     $lines = @(& wsl.exe --list --quiet 2>$null)
+    return @($lines | ForEach-Object {
+        ([string]$_).Replace(([char]0).ToString(), '').Trim()
+    } | Where-Object { $_ })
+}
+
+function Get-RunningDistros {
+    $lines = @(& wsl.exe --list --running --quiet 2>$null)
     return @($lines | ForEach-Object {
         ([string]$_).Replace(([char]0).ToString(), '').Trim()
     } | Where-Object { $_ })
@@ -210,27 +323,82 @@ function Convert-ToWslProgramDataPath([string]$WindowsPath) {
     return '/mnt/c/' + $resolved.Substring(3).Replace('\', '/')
 }
 
-function Register-RuntimeAndCleanup($State, [DateTimeOffset]$ExpiresAt) {
-    $runtimeAction = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wsl.exe" -Argument (
-        '-d ' + [string]$State.distro_name + ' -u root -- /usr/local/sbin/opti-wsl-keepalive'
+function Register-RuntimeAndCleanup($State, $ExpiresAt) {
+    $windowStyle = if ([bool]$State.run_in_background) { 'Hidden' } else { 'Normal' }
+    $runtimeAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
+        '-NoProfile -WindowStyle ' + $windowStyle + ' -ExecutionPolicy Bypass -File "' +
+        $InstalledBootstrap + '" -RuntimeAction run'
     )
-    $runtimeTrigger = New-ScheduledTaskTrigger -AtLogOn -User ([string]$State.user_name)
-    Register-InteractiveTask -Name $RuntimeTask -Action $runtimeAction -Trigger $runtimeTrigger -UserName ([string]$State.user_name)
+    $runtimeTrigger = if ([bool]$State.schedule_enabled) {
+        $null
+    } else {
+        New-ScheduledTaskTrigger -AtLogOn -User ([string]$State.user_name)
+    }
+    Register-InteractiveTask -Name $RuntimeTask -Action $runtimeAction -Trigger $runtimeTrigger `
+        -UserName ([string]$State.user_name)
 
-    $uninstaller = Join-Path $InstallRoot 'Remove-OptiTemporaryWorker.ps1'
-    $cleanupAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
-        '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $uninstaller +
-        '" -Automatic -InstanceId "' + [string]$State.instance_id + '"'
-    )
-    $at = $ExpiresAt.LocalDateTime
-    if ($at -lt (Get-Date).AddMinutes(1)) { $at = (Get-Date).AddMinutes(1) }
-    $cleanupTrigger = New-ScheduledTaskTrigger -Once -At $at
-    Register-InteractiveTask -Name $CleanupTask -Action $cleanupAction -Trigger $cleanupTrigger -UserName ([string]$State.user_name)
+    if ([bool]$State.schedule_enabled) {
+        $scheduleAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
+            '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' +
+            $InstalledBootstrap + '" -RuntimeAction monitor'
+        )
+        $scheduleTrigger = New-ScheduledTaskTrigger -AtLogOn -User ([string]$State.user_name)
+        Register-InteractiveTask -Name $ScheduleTask -Action $scheduleAction -Trigger $scheduleTrigger `
+            -UserName ([string]$State.user_name)
+    } else {
+        Unregister-ScheduledTask -TaskName $ScheduleTask -Confirm:$false -ErrorAction SilentlyContinue
+    }
+
+    if ($null -ne $ExpiresAt) {
+        $uninstaller = Join-Path $InstallRoot 'Remove-OptiTemporaryWorker.ps1'
+        $cleanupAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
+            '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $uninstaller +
+            '" -Automatic -InstanceId "' + [string]$State.instance_id + '"'
+        )
+        $at = $ExpiresAt.LocalDateTime
+        if ($at -lt (Get-Date).AddMinutes(1)) { $at = (Get-Date).AddMinutes(1) }
+        $cleanupTrigger = New-ScheduledTaskTrigger -Once -At $at
+        Register-InteractiveTask -Name $CleanupTask -Action $cleanupAction -Trigger $cleanupTrigger `
+            -UserName ([string]$State.user_name)
+    } else {
+        Unregister-ScheduledTask -TaskName $CleanupTask -Confirm:$false -ErrorAction SilentlyContinue
+    }
 }
 
 if (-not (Test-Administrator)) {
     Start-Elevated
     exit 0
+}
+
+if ($RuntimeAction) {
+    if ($RuntimeAction -notin @('run', 'start', 'stop', 'reconcile', 'monitor')) {
+        throw "Unknown Opti runtime action: $RuntimeAction"
+    }
+    $runtimeState = Read-State
+    switch ($RuntimeAction) {
+        'run' {
+            $runtimeLog = Join-Path $InstallRoot 'logs\runtime.log'
+            Hold-SystemAwake ([bool]$runtimeState.prevent_sleep)
+            try {
+                & wsl.exe -d ([string]$runtimeState.distro_name) -u root -- `
+                    /usr/local/sbin/opti-wsl-keepalive *>> $runtimeLog
+                exit $LASTEXITCODE
+            } finally {
+                Release-SystemAwake
+            }
+        }
+        'start' { Start-WorkerRuntime $runtimeState; exit 0 }
+        'stop' { Stop-WorkerRuntime $runtimeState; exit 0 }
+        'reconcile' { [void](Invoke-ScheduleReconcile $runtimeState); exit 0 }
+        'monitor' {
+            while (Test-Path -LiteralPath $StatePath -PathType Leaf) {
+                $runtimeState = Read-State
+                if (-not (Invoke-ScheduleReconcile $runtimeState)) { break }
+                Start-Sleep -Seconds 30
+            }
+            exit 0
+        }
+    }
 }
 
 try {
@@ -248,6 +416,27 @@ try {
         $vmpFeatureBefore = Get-WindowsOptionalFeature -Online -FeatureName 'VirtualMachinePlatform'
         $wslAppBefore = @(Get-AppxPackage -AllUsers -Name 'MicrosoftCorporationII.WindowsSubsystemForLinux' `
             -ErrorAction SilentlyContinue)
+        $runInBackground = if ($null -eq $join.runtime -or $null -eq $join.runtime.background) {
+            $true
+        } else { [bool]$join.runtime.background }
+        $preventSleep = if ($null -eq $join.runtime -or $null -eq $join.runtime.prevent_sleep) {
+            $true
+        } else { [bool]$join.runtime.prevent_sleep }
+        $scheduleEnabled = $null -ne $join.schedule -and [bool]$join.schedule.enabled
+        $scheduleTimezone = if ($null -ne $join.schedule -and [string]$join.schedule.time_zone) {
+            Resolve-ScheduleTimeZone ([string]$join.schedule.time_zone)
+        } else { Resolve-ScheduleTimeZone 'Central Standard Time' }
+        $scheduleStart = if ($null -ne $join.schedule -and [string]$join.schedule.start_time) {
+            [string]$join.schedule.start_time
+        } else { '19:00' }
+        $scheduleStop = if ($null -ne $join.schedule -and [string]$join.schedule.stop_time) {
+            [string]$join.schedule.stop_time
+        } else { '07:00' }
+        if ($scheduleStart -notmatch '^(?:[01]\d|2[0-3]):[0-5]\d$' -or
+            $scheduleStop -notmatch '^(?:[01]\d|2[0-3]):[0-5]\d$' -or
+            ($scheduleEnabled -and $scheduleStart -eq $scheduleStop)) {
+            throw 'The daily WSL schedule is invalid.'
+        }
         $state = [pscustomobject]@{
             format = 'opti-temporary-worker-install-v1'
             phase = 'created'
@@ -263,6 +452,16 @@ try {
             wsl_app_installed_by_opti = $false
             wslconfig_recorded = $false
             wslconfig_existed = $false
+            machine_id = ''
+            machine_name = ''
+            slot_count = 0
+            expires_at = ''
+            run_in_background = $runInBackground
+            prevent_sleep = $preventSleep
+            schedule_enabled = $scheduleEnabled
+            schedule_timezone = $scheduleTimezone
+            schedule_start = $scheduleStart
+            schedule_stop = $scheduleStop
             created_at = [DateTime]::UtcNow.ToString('o')
             updated_at = [DateTime]::UtcNow.ToString('o')
         }
@@ -275,6 +474,22 @@ try {
         $JoinBundle = Unprotect-JoinBundle $ProtectedJoinPath
         $join = ConvertFrom-JoinBundle $JoinBundle
     }
+
+    # State files from an interrupted older bootstrap remain resumable. Add
+    # every newer field explicitly instead of assigning a missing PSCustomObject
+    # property, which caused the previous machine_id setup failure.
+    $stateDefaults = @{
+        machine_id = ''; machine_name = ''; slot_count = 0; expires_at = ''
+        run_in_background = $true; prevent_sleep = $true; schedule_enabled = $false
+        schedule_timezone = 'Central Standard Time'; schedule_start = '19:00'; schedule_stop = '07:00'
+    }
+    foreach ($name in $stateDefaults.Keys) {
+        if ($state.PSObject.Properties.Name -notcontains $name) {
+            Set-StateValue $state $name $stateDefaults[$name]
+        }
+    }
+    Set-StateValue $state 'schedule_timezone' (Resolve-ScheduleTimeZone ([string]$state.schedule_timezone))
+    Save-State $state
 
     Write-Step "Continuing Opti temporary worker setup at phase $($state.phase)"
     $featuresChanged = Enable-WslFeatures
@@ -355,18 +570,21 @@ try {
     if (-not (Test-Path -LiteralPath $leasePath -PathType Leaf)) { throw 'The host-issued worker lease handoff is missing.' }
     $lease = Get-Content -LiteralPath $leasePath -Raw | ConvertFrom-Json
     if ([string]$lease.format -ne 'opti-temporary-worker-lease-v1') { throw 'The worker lease handoff is invalid.' }
-    $expiresAt = [DateTimeOffset]::Parse([string]$lease.expires_at)
-    Register-RuntimeAndCleanup -State $state -ExpiresAt $expiresAt
+    $expiresAt = $null
+    if ([string]$lease.expires_at) { $expiresAt = [DateTimeOffset]::Parse([string]$lease.expires_at) }
+    Set-StateValue $state 'phase' 'registering-runtime'
+    Set-StateValue $state 'machine_id' ([string]$lease.machine_id)
+    Set-StateValue $state 'machine_name' ([string]$lease.machine_name)
+    Set-StateValue $state 'slot_count' ([int]$lease.slot_count)
+    Set-StateValue $state 'expires_at' $(if ($null -ne $expiresAt) { $expiresAt.ToString('o') } else { '' })
+    Save-State $state
     & wsl.exe -d ([string]$state.distro_name) -u root -- systemctl enable opti-temporary-worker.service
     if ($LASTEXITCODE -ne 0) { throw 'Could not enable the WSL worker service.' }
-    Start-ScheduledTask -TaskName $RuntimeTask
-
-    $state.phase = 'complete'
-    $state.machine_id = [string]$lease.machine_id
-    $state.machine_name = [string]$lease.machine_name
-    $state.slot_count = [int]$lease.slot_count
-    $state.expires_at = $expiresAt.ToString('o')
+    Register-RuntimeAndCleanup -State $state -ExpiresAt $expiresAt
+    Set-StateValue $state 'phase' 'complete'
     Save-State $state
+    if ([bool]$state.schedule_enabled) { Start-ScheduledTask -TaskName $ScheduleTask }
+    else { Start-WorkerRuntime $state }
     Remove-Item -LiteralPath $ProtectedJoinPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $rootfs -Force -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $SetupTask -Confirm:$false -ErrorAction SilentlyContinue
@@ -375,7 +593,8 @@ try {
     if ($downloadedBootstrap -eq $expectedDownload -and $downloadedBootstrap -ne $InstalledBootstrap) {
         Remove-Item -LiteralPath $downloadedBootstrap -Force -ErrorAction SilentlyContinue
     }
-    Write-Step "Opti temporary WSL worker is ready with $($state.slot_count) CPU slots until $($state.expires_at)."
+    $lifetime = if ([string]$state.expires_at) { "until $($state.expires_at)" } else { 'with no automatic expiration' }
+    Write-Step "Opti temporary WSL worker is ready with $($state.slot_count) CPU slots $lifetime."
 } catch {
     Write-Step "SETUP FAILED: $($_.Exception.Message)"
     Write-Error $_
